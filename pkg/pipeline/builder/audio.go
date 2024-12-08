@@ -27,7 +27,8 @@ import (
 	lksdk "github.com/livekit/server-sdk-go/v2"
 )
 
-const audioMixerLatency = uint64(2e9)
+// const audioMixerLatency = uint64(2e9)
+const audioMixerLatency = uint64(500 * 1000 * 1000) // 500 milliseconds
 
 type AudioBin struct {
 	bin  *gstreamer.Bin

@@ -16,9 +16,9 @@ package builder
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/go-gst/go-gst/gst"
 
@@ -32,7 +32,11 @@ import (
 
 const (
 	videoTestSrcName = "video_test_src"
+	keyframeDefault  = 1.0
+	//UseVAAPI         = true
 )
+
+var UseVAAPI = len(os.Getenv("GST_VAAPI_ALL_DRIVERS")) > 0
 
 type VideoBin struct {
 	bin  *gstreamer.Bin
@@ -233,7 +237,7 @@ func (b *VideoBin) buildWebInput() error {
 		return err
 	}
 
-	if err = b.addDecodedVideoSink(); err != nil {
+	if err := b.addDecodedVideoSink(); err != nil {
 		return err
 	}
 
@@ -315,7 +319,7 @@ func (b *VideoBin) buildAppSrcBin(ts *config.TrackSource, name string) (*gstream
 	appSrcBin := b.bin.NewBin(name)
 	ts.AppSrc.Element.SetArg("format", "time")
 	if err := ts.AppSrc.Element.SetProperty("is-live", true); err != nil {
-		return nil, errors.ErrGstPipelineError(err)
+		return nil, err
 	}
 	if err := appSrcBin.AddElement(ts.AppSrc.Element); err != nil {
 		return nil, err
@@ -350,25 +354,31 @@ func (b *VideoBin) buildAppSrcBin(ts *config.TrackSource, name string) (*gstream
 		}
 
 		if b.conf.VideoDecoding {
-			avDecH264, err := gst.NewElement("avdec_h264")
-			if err != nil {
-				return nil, errors.ErrGstPipelineError(err)
-			}
-
-			if err = appSrcBin.AddElement(avDecH264); err != nil {
-				return nil, err
-			}
-		} else {
 			h264Parse, err := gst.NewElement("h264parse")
 			if err != nil {
 				return nil, errors.ErrGstPipelineError(err)
 			}
-
 			if err = appSrcBin.AddElement(h264Parse); err != nil {
 				return nil, err
 			}
 
-			return appSrcBin, nil
+			if UseVAAPI {
+				vaapidec, err := gst.NewElement("vaapih264dec")
+				if err == nil {
+					if err = appSrcBin.AddElement(vaapidec); err == nil {
+						break
+					}
+				}
+				logger.Warnw("VAAPI decoder not available, falling back to software", err)
+			}
+
+			avdec, err := gst.NewElement("avdec_h264")
+			if err != nil {
+				return nil, errors.ErrGstPipelineError(err)
+			}
+			if err = appSrcBin.AddElement(avdec); err != nil {
+				return nil, err
+			}
 		}
 
 	case types.MimeTypeVP8:
@@ -463,6 +473,7 @@ func (b *VideoBin) addVideoTestSrcBin() error {
 		return err
 	}
 
+	// Create test source - use the proper element name
 	videoTestSrc, err := gst.NewElement("videotestsrc")
 	if err != nil {
 		return errors.ErrGstPipelineError(err)
@@ -472,11 +483,20 @@ func (b *VideoBin) addVideoTestSrcBin() error {
 	}
 	videoTestSrc.SetArg("pattern", "black")
 
-	queue, err := gstreamer.BuildQueue("video_test_src_queue", config.Latency, false)
+	// Build queue with our identifying prefix
+	queue, err := gstreamer.BuildQueue(fmt.Sprintf("%s_queue", videoTestSrcName),
+		config.Latency, false)
 	if err != nil {
 		return err
 	}
-	if err = queue.SetProperty("min-threshold-time", uint64(2e9)); err != nil {
+	//if err = queue.SetProperty("min-threshold-time", uint64(2e9)); err != nil {
+	if err = queue.SetProperty("min-threshold-time", uint64(100*1000*1000)); err != nil {
+		return errors.ErrGstPipelineError(err)
+	}
+
+	// Insert videoconvert to ensure format conversion to NV12
+	videoconvert, err := gst.NewElement("videoconvert")
+	if err != nil {
 		return errors.ErrGstPipelineError(err)
 	}
 
@@ -485,7 +505,8 @@ func (b *VideoBin) addVideoTestSrcBin() error {
 		return errors.ErrGstPipelineError(err)
 	}
 
-	if err = testSrcBin.AddElements(videoTestSrc, queue, caps); err != nil {
+	// Add elements in the correct order: videotestsrc -> queue -> videoconvert -> capsfilter
+	if err = testSrcBin.AddElements(videoTestSrc, queue, videoconvert, caps); err != nil {
 		return err
 	}
 
@@ -530,102 +551,110 @@ func (b *VideoBin) addEncoder() error {
 	}
 
 	switch b.conf.VideoOutCodec {
-	// we only encode h264, the rest are too slow
 	case types.MimeTypeH264:
-		x264Enc, err := gst.NewElement("x264enc")
+		if UseVAAPI {
+			vaapih264enc, err := gst.NewElement("vaapih264enc")
+			if err == nil {
+				vaapih264enc.SetArg("rate-control", "cbr")
+				vaapih264enc.SetArg("tune", "low-latency")
+				if err = vaapih264enc.SetProperty("bitrate", uint(b.conf.VideoBitrate)); err == nil {
+					// Set keyframe interval: either from config or default to 1 second
+					var keyframeInterval uint
+					if b.conf.KeyFrameInterval != 0 {
+						keyframeInterval = uint(b.conf.KeyFrameInterval * float64(b.conf.Framerate))
+					} else {
+						keyframeInterval = uint(keyframeDefault * float64(b.conf.Framerate))
+					}
+
+					if err = vaapih264enc.SetProperty("keyframe-period", keyframeInterval); err == nil {
+						h264parse, err := gst.NewElement("h264parse")
+						if err == nil {
+							h264parse.SetArg("config-interval", "-1")
+
+							caps, err := gst.NewElement("capsfilter")
+							if err == nil {
+								caps.SetProperty("caps", gst.NewCapsFromString(fmt.Sprintf(
+									"video/x-h264,profile=%s",
+									b.conf.VideoProfile,
+								)))
+
+								if err = b.bin.AddElements(vaapih264enc, h264parse, caps); err == nil {
+									return nil
+								}
+							}
+						}
+					}
+				}
+			}
+			logger.Warnw("VAAPI encoder setup failed, falling back to software", err)
+		}
+
+		// Software fallback
+		x264enc, err := gst.NewElement("x264enc")
 		if err != nil {
 			return errors.ErrGstPipelineError(err)
 		}
 
-		x264Enc.SetArg("speed-preset", "veryfast")
+		x264enc.SetArg("speed-preset", "veryfast")
+		x264enc.SetArg("tune", "zerolatency")
+		x264enc.SetProperty("bitrate", uint(b.conf.VideoBitrate))
+		x264enc.SetProperty("vbv-buf-capacity", uint(100))
+
+		// Set keyframe interval: either from config or default to 1 second
+		var keyframeInterval uint
 		if b.conf.KeyFrameInterval != 0 {
-			keyframeInterval := uint(b.conf.KeyFrameInterval * float64(b.conf.Framerate))
-			if err = x264Enc.SetProperty("key-int-max", keyframeInterval); err != nil {
-				return errors.ErrGstPipelineError(err)
-			}
+			keyframeInterval = uint(b.conf.KeyFrameInterval * float64(b.conf.Framerate))
+		} else {
+			keyframeInterval = uint(keyframeDefault * float64(b.conf.Framerate))
 		}
+		x264enc.SetProperty("key-int-max", keyframeInterval)
 
 		var options []string
-		bufCapacity := uint(2000) // 2s
-		if b.conf.GetSegmentConfig() != nil {
-			// avoid key frames other than at segments boundaries as splitmuxsink can become inconsistent otherwise
-			options = append(options, "scenecut=0")
-			bufCapacity = uint(time.Duration(b.conf.GetSegmentConfig().SegmentDuration) * (time.Second / time.Millisecond))
-		}
-		if bufCapacity > 10000 {
-			// Max value allowed by gstreamer
-			bufCapacity = 10000
-		}
-		bufCapacity = uint(100) // 100 ms
-		if err = x264Enc.SetProperty("vbv-buf-capacity", bufCapacity); err != nil {
-			return errors.ErrGstPipelineError(err)
-		}
-
-		if err = x264Enc.SetProperty("bitrate", uint(b.conf.VideoBitrate)); err != nil {
-			return errors.ErrGstPipelineError(err)
-		}
-
 		if sc := b.conf.GetStreamConfig(); sc != nil && sc.OutputType == types.OutputTypeRTMP {
 			options = append(options, "nal-hrd=cbr")
 		}
 		if len(options) > 0 {
-			optionString := strings.Join(options, ":")
-			if err = x264Enc.SetProperty("option-string", optionString); err != nil {
-				return errors.ErrGstPipelineError(err)
-			}
+			x264enc.SetProperty("option-string", strings.Join(options, ":"))
 		}
 
 		caps, err := gst.NewElement("capsfilter")
 		if err != nil {
 			return errors.ErrGstPipelineError(err)
 		}
-		if err = caps.SetProperty("caps", gst.NewCapsFromString(fmt.Sprintf(
+		caps.SetProperty("caps", gst.NewCapsFromString(fmt.Sprintf(
 			"video/x-h264,profile=%s",
 			b.conf.VideoProfile,
-		))); err != nil {
-			return errors.ErrGstPipelineError(err)
-		}
+		)))
 
-		if err = b.bin.AddElements(x264Enc, caps); err != nil {
-			return err
-		}
-		return nil
+		return b.bin.AddElements(x264enc, caps)
+	}
 
-	case types.MimeTypeVP9:
-		vp9Enc, err := gst.NewElement("vp9enc")
+	return errors.ErrNotSupported(fmt.Sprintf("%s encoding", b.conf.VideoOutCodec))
+}
+
+func (b *VideoBin) addVAAPIDecoder(bin *gstreamer.Bin) error {
+	vaapidec, err := gst.NewElement("vaapih264dec")
+	if err != nil {
+		logger.Warnw("VAAPI decoder not available, falling back to software", err)
+		decoder, err := gst.NewElement("avdec_h264")
 		if err != nil {
 			return errors.ErrGstPipelineError(err)
 		}
-		if err = vp9Enc.SetProperty("deadline", int64(1)); err != nil {
-			return errors.ErrGstPipelineError(err)
-		}
-		if err = vp9Enc.SetProperty("row-mt", true); err != nil {
-			return errors.ErrGstPipelineError(err)
-		}
-		if err = vp9Enc.SetProperty("tile-columns", 3); err != nil {
-			return errors.ErrGstPipelineError(err)
-		}
-		if err = vp9Enc.SetProperty("tile-rows", 1); err != nil {
-			return errors.ErrGstPipelineError(err)
-		}
-		if err = vp9Enc.SetProperty("frame-parallel", true); err != nil {
-			return errors.ErrGstPipelineError(err)
-		}
-		if err = vp9Enc.SetProperty("max-quantizer", 52); err != nil {
-			return errors.ErrGstPipelineError(err)
-		}
-		if err = vp9Enc.SetProperty("min-quantizer", 2); err != nil {
-			return errors.ErrGstPipelineError(err)
-		}
-		if err = b.bin.AddElement(vp9Enc); err != nil {
-			return err
-		}
-
-		fallthrough
-
-	default:
-		return errors.ErrNotSupported(fmt.Sprintf("%s encoding", b.conf.VideoOutCodec))
+		return bin.AddElement(decoder)
 	}
+
+	// Add a capsfilter before VAAPI decoder to ensure proper format
+	decCaps, err := gst.NewElement("capsfilter")
+	if err != nil {
+		return errors.ErrGstPipelineError(err)
+	}
+	if err = decCaps.SetProperty("caps", gst.NewCapsFromString(
+		"video/x-h264,stream-format=byte-stream,alignment=au",
+	)); err != nil {
+		return errors.ErrGstPipelineError(err)
+	}
+
+	return bin.AddElements(decCaps, vaapidec)
 }
 
 func (b *VideoBin) addDecodedVideoSink() error {
@@ -691,18 +720,19 @@ func (b *VideoBin) newVideoCapsFilter(includeFramerate bool) (*gst.Element, erro
 	if err != nil {
 		return nil, errors.ErrGstPipelineError(err)
 	}
+	var capsStr string
 	if includeFramerate {
-		err = caps.SetProperty("caps", gst.NewCapsFromString(fmt.Sprintf(
-			"video/x-raw,framerate=%d/1,format=I420,width=%d,height=%d,colorimetry=bt709,chroma-site=mpeg2,pixel-aspect-ratio=1/1",
+		capsStr = fmt.Sprintf(
+			"video/x-raw,framerate=%d/1,format=NV12,width=%d,height=%d,colorimetry=bt709,chroma-site=mpeg2,pixel-aspect-ratio=1/1",
 			b.conf.Framerate, b.conf.Width, b.conf.Height,
-		)))
+		)
 	} else {
-		err = caps.SetProperty("caps", gst.NewCapsFromString(fmt.Sprintf(
-			"video/x-raw,format=I420,width=%d,height=%d,colorimetry=bt709,chroma-site=mpeg2,pixel-aspect-ratio=1/1",
+		capsStr = fmt.Sprintf(
+			"video/x-raw,format=NV12,width=%d,height=%d,colorimetry=bt709,chroma-site=mpeg2,pixel-aspect-ratio=1/1",
 			b.conf.Width, b.conf.Height,
-		)))
+		)
 	}
-	if err != nil {
+	if err = caps.SetProperty("caps", gst.NewCapsFromString(capsStr)); err != nil {
 		return nil, errors.ErrGstPipelineError(err)
 	}
 	return caps, nil

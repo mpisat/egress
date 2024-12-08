@@ -161,6 +161,9 @@ func (sb *StreamBin) AddStream(stream *config.Stream) error {
 	if err = sink.SetProperty("sync", false); err != nil {
 		return errors.ErrGstPipelineError(err)
 	}
+
+	sink.SetProperty("retry", 1) // Minimal retry attempts
+
 	if err = b.AddElements(queue, sink); err != nil {
 		return err
 	}

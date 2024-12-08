@@ -22,5 +22,16 @@ rm -rf /home/egress/tmp/*
 rm -rf /var/run/pulse /var/lib/pulse /home/egress/.config/pulse /home/egress/.cache/xdgr/pulse
 pulseaudio -D --verbose --exit-idle-time=-1 --disallow-exit
 
+# Add to entrypoint.sh
+vainfo --display drm --device /dev/dri/renderD128
+if [ $? -ne 0 ]; then
+    echo "VAAPI not available"
+    # Set a flag to disable VAAPI
+    export GST_VAAPI_ALL_DRIVERS=0
+else
+    echo "VAAPI available"
+    export GST_VAAPI_ALL_DRIVERS=1
+fi
+
 # Run egress service
 exec /tini -- egress

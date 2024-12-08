@@ -65,7 +65,12 @@ RUN apt-get update && \
     unzip \
     wget \
     xvfb \
-    gstreamer1.0-plugins-base-
+    gstreamer1.0-plugins-base- \
+    intel-media-va-driver-non-free \
+    vainfo \
+    libva-dev \
+    libva-drm2 \
+    gstreamer1.0-vaapi
 
 # install chrome
 COPY --from=livekit/chrome-installer:125.0.6422.141 /chrome-installer /chrome-installer
@@ -86,7 +91,13 @@ COPY --from=0 /tini /tini
 COPY build/egress/entrypoint.sh /
 
 # run
+RUN usermod -a -G video egress
+
 USER egress
+ENV GST_VAAPI_ALL_DRIVERS=1
+ENV GST_VAAPI_DRM_DEVICE=/dev/dri/renderD128
+ENV LIBVA_DRIVER_NAME=iHD
+ENV LIBVA_DRIVERS_PATH=/usr/lib/x86_64-linux-gnu/dri
 ENV PATH=${PATH}:/chrome
 ENV XDG_RUNTIME_DIR=/home/egress/.cache/xdgr
 ENV CHROME_DEVEL_SANDBOX=/usr/local/sbin/chrome-devel-sandbox
