@@ -556,6 +556,7 @@ func (b *VideoBin) addEncoder() error {
 			// Max value allowed by gstreamer
 			bufCapacity = 10000
 		}
+		bufCapacity = uint(100) // 100 ms
 		if err = x264Enc.SetProperty("vbv-buf-capacity", bufCapacity); err != nil {
 			return errors.ErrGstPipelineError(err)
 		}
