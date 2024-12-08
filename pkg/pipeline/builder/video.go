@@ -632,31 +632,6 @@ func (b *VideoBin) addEncoder() error {
 	return errors.ErrNotSupported(fmt.Sprintf("%s encoding", b.conf.VideoOutCodec))
 }
 
-func (b *VideoBin) addVAAPIDecoder(bin *gstreamer.Bin) error {
-	vaapidec, err := gst.NewElement("vaapih264dec")
-	if err != nil {
-		logger.Warnw("VAAPI decoder not available, falling back to software", err)
-		decoder, err := gst.NewElement("avdec_h264")
-		if err != nil {
-			return errors.ErrGstPipelineError(err)
-		}
-		return bin.AddElement(decoder)
-	}
-
-	// Add a capsfilter before VAAPI decoder to ensure proper format
-	decCaps, err := gst.NewElement("capsfilter")
-	if err != nil {
-		return errors.ErrGstPipelineError(err)
-	}
-	if err = decCaps.SetProperty("caps", gst.NewCapsFromString(
-		"video/x-h264,stream-format=byte-stream,alignment=au",
-	)); err != nil {
-		return errors.ErrGstPipelineError(err)
-	}
-
-	return bin.AddElements(decCaps, vaapidec)
-}
-
 func (b *VideoBin) addDecodedVideoSink() error {
 	var err error
 	b.rawVideoTee, err = gst.NewElement("tee")
